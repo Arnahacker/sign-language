@@ -15,7 +15,7 @@ print(f"Detected Actions: {actions}")
 
 sequences, labels = [], []
 
-print("📂 Loading data with Augmentation (Jitter/Zoom)...")
+print("Loading data with Augmentation")
 
 for action in actions:
     action_path = os.path.join(DATA_PATH, action)
@@ -31,18 +31,11 @@ for action in actions:
                 window.append(res)
             
             original_sequence = np.array(window) # (30, 258)
-            
-            # ✅ FIX 1: DATA AUGMENTATION
-            # 1. Original
             sequences.append(original_sequence)
             labels.append(label_map[action])
-            
-            # 2. Jitter (Noise)
-            noise = np.random.normal(0, 0.02, original_sequence.shape) # Gentle noise
+            noise = np.random.normal(0, 0.02, original_sequence.shape) 
             sequences.append(original_sequence + noise)
             labels.append(label_map[action])
-            
-            # 3. Scaling (Zoom)
             scale = np.random.uniform(0.95, 1.05) # +/- 5% size
             sequences.append(original_sequence * scale)
             labels.append(label_map[action])
@@ -50,12 +43,11 @@ for action in actions:
         except Exception as e:
             pass
 
-print(f"📊 Total Sequences (Tripled): {len(sequences)}")
+print(f"Total Sequences: {len(sequences)}")
 
 X = np.array(sequences)
 y = np.array(labels)
 
-# ✅ FIX 2: STRATIFIED SPLIT (Fair Test)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, stratify=y, random_state=42)
 
 # Convert to Torch
@@ -70,14 +62,13 @@ test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-# --- 2. THE POLISHED MODEL ---
 class HybridModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes):
         super(HybridModel, self).__init__()
         
         self.feature_extract = nn.Sequential(
             nn.Linear(input_size, 128),
-            nn.BatchNorm1d(30),  # ✅ FIX 3: STABILITY (Prevents crashing if you move slightly)
+            nn.BatchNorm1d(30), 
             nn.ReLU(),
             nn.Dropout(0.3)
         )
@@ -98,7 +89,7 @@ class HybridModel(nn.Module):
         out = self.fc(context_vector)
         return out
 
-# Model Hyperparameters
+
 INPUT_SIZE = 258 
 HIDDEN_SIZE = 64
 NUM_LAYERS = 2
@@ -111,7 +102,7 @@ optimizer = optim.Adam(model.parameters(), lr=0.0005)
 
 # --- 3. TRAINING LOOP ---
 EPOCHS = 80 # 150 is plenty with the augmented data
-print(f"🚀 Starting training for {EPOCHS} epochs...")
+print(f"Starting training for {EPOCHS} epochs...")
 
 for epoch in range(EPOCHS):
     model.train()
@@ -162,5 +153,5 @@ labels_path = os.path.join(save_dir, 'labels.npy')
 torch.save(model.state_dict(), model_path)
 np.save(labels_path, actions)
 
-print(f"✅ Model saved to: {model_path}")
+print(f"Model saved to: {model_path}")
 print("IMPORTANT: Copy this 'HybridModel' class to your api.py before running the server!")
