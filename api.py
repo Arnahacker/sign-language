@@ -1,142 +1,142 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
-import torch.nn as nn
 import numpy as np
 import os
-from typing import List, Optional
-from Converting_words_to_sentences import OllamaHandler 
+from typing import List
+from model import HybridModel
+from converting_words_to_sentences import OllamaHandler
 
-app = FastAPI(title="Sign Language Brain API")
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR             = os.path.dirname(os.path.abspath(__file__))
+SCRIPTED_MODEL_PATH  = os.path.join(BASE_DIR, "Final_model_parameters", "action_scripted.pt")
+MODEL_PATH           = os.path.join(BASE_DIR, "Final_model_parameters", "action.pth")
+LABELS_PATH          = os.path.join(BASE_DIR, "Final_model_parameters", "labels.npy")
+
 CONFIDENCE_THRESHOLD = 0.85
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "Final_model_parameters", "action.pth")
-LABELS_PATH = os.path.join(BASE_DIR, "Final_model_parameters", "labels.npy")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class HybridModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(HybridModel, self).__init__()
-        self.feature_extract = nn.Sequential(
-            nn.Linear(input_size, 128),
-            nn.BatchNorm1d(30), 
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
-        self.lstm = nn.LSTM(128, hidden_size, num_layers, batch_first=True, bidirectional=True)
-        self.attention = nn.Linear(hidden_size * 2, 1)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
+model      = None
+actions    = None
+llm        = None
+cpp_engine = None  # C++ inference engine if available
 
-    def forward(self, x):
-        x = self.feature_extract(x)
-        lstm_out, _ = self.lstm(x)
-        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
-        context_vector = torch.sum(attn_weights * lstm_out, dim=1)
-        out = self.fc(context_vector)
-        return out
+# ── Try loading the C++ engine ─────────────────────────────────────────────────
+try:
+    import sign_inference as _si
+    _CPP_AVAILABLE = True
+except ImportError:
+    _CPP_AVAILABLE = False
+    print("C++ module not found — run build.sh to enable it. Falling back to Python.")
 
-model = None
-actions = None
-llm = None
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-@app.on_event("startup")
 def load_resources():
-    global model, actions, llm
-    print("API Starting up")
-    
+    global model, actions, llm, cpp_engine
+
+    # Load labels
     if os.path.exists(LABELS_PATH):
         actions = np.load(LABELS_PATH)
-        print(f"Loaded Labels: {LABELS_PATH}")
+        print(f"Loaded {len(actions)} labels")
     else:
-        print(f"Error: Labels not found at {LABELS_PATH}")
-        actions = np.array(["unknown"]) 
+        print(f"Labels not found at {LABELS_PATH}")
+        actions = np.array(["unknown"])
 
-    input_size = 258
-    hidden_size = 64
-    num_layers = 2
-    num_classes = len(actions)
-
-    model = HybridModel(input_size, hidden_size, num_layers, num_classes).to(device)
-    
-    if os.path.exists(MODEL_PATH):
+    # Try C++ engine first
+    if _CPP_AVAILABLE and os.path.exists(SCRIPTED_MODEL_PATH):
         try:
-            state_dict = torch.load(MODEL_PATH, map_location=device)
-            model.load_state_dict(state_dict)
-            model.eval()
-            print(f"Loaded Model: {MODEL_PATH}")
+            cpp_engine = _si.SignInferenceEngine(SCRIPTED_MODEL_PATH)
+            print("Using C++ inference engine (LibTorch)")
         except Exception as e:
-            print(f"Œ Model Load Failed: {e}")
-    else:
-        print(f"Error: Model not found at {MODEL_PATH}")
-    
+            print(f"C++ engine failed: {e}")
+            cpp_engine = None
+
+    # Fall back to TorchScript in Python
+    if cpp_engine is None and os.path.exists(SCRIPTED_MODEL_PATH):
+        try:
+            model = torch.jit.load(SCRIPTED_MODEL_PATH, map_location=device)
+            model.eval()
+            print("Using TorchScript Python inference")
+        except Exception as e:
+            print(f"TorchScript load failed: {e}")
+
+    # Last resort: plain state dict
+    if cpp_engine is None and model is None and os.path.exists(MODEL_PATH):
+        try:
+            m = HybridModel(258, 64, 2, len(actions)).to(device)
+            m.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+            m.eval()
+            model = m
+            print("Using state dict Python inference")
+        except Exception as e:
+            print(f"State dict load failed: {e}")
+
     # Load LLM
     try:
-        llm = OllamaHandler(model="llama3") 
-        print("LLM Ready")
+        llm = OllamaHandler(model="llama3")
+        print("LLM ready")
     except Exception as e:
-        print(f"LLM Failed: {e}")
+        print(f"LLM failed: {e}")
 
-# --- 5. DATA STRUCTURES ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_resources()
+    yield
+
+
+app = FastAPI(title="Sign Language Brain API", lifespan=lifespan)
+
+
 class SequenceInput(BaseModel):
-    sequence: List[List[float]] 
+    sequence: List[List[float]]
+
 
 class TranslationInput(BaseModel):
     words: List[str]
 
-# --- 6. ENDPOINTS ---
 
 @app.post("/predict")
 def predict_sign(payload: SequenceInput):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    if cpp_engine is None and model is None:
+        raise HTTPException(status_code=503, detail="No inference engine loaded")
 
     try:
-        input_data = np.array(payload.sequence)
-        
-        # Validation
-        if input_data.shape != (30, 258):
-            raise HTTPException(status_code=400, detail=f"Expected shape (30, 258), got {input_data.shape}")
-
-        tensor_data = torch.FloatTensor(input_data).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            output = model(tensor_data)
-            probs = torch.softmax(output, dim=1).cpu().numpy()[0]
-        
-        prediction_idx = np.argmax(probs)
-        confidence = float(probs[prediction_idx])
-        
-        if prediction_idx < len(actions):
-            action_label = str(actions[prediction_idx])
+        if cpp_engine is not None:
+            # ── C++ path ───────────────────────────────────────────────────────
+            result         = cpp_engine.predict(payload.sequence)
+            prediction_idx = result.index
+            confidence     = result.confidence
         else:
-            action_label = "Error"
+            # ── Python fallback path ───────────────────────────────────────────
+            input_data = np.array(payload.sequence)
+            if input_data.shape != (30, 258):
+                raise HTTPException(status_code=400, detail=f"Expected shape (30, 258), got {input_data.shape}")
+
+            tensor_data = torch.FloatTensor(input_data).unsqueeze(0).to(device)
+            with torch.no_grad():
+                output = model(tensor_data)
+                probs  = torch.softmax(output, dim=1).cpu().numpy()[0]
+
+            prediction_idx = int(np.argmax(probs))
+            confidence     = float(probs[prediction_idx])
+
+        action_label = str(actions[prediction_idx]) if prediction_idx < len(actions) else "Error"
 
         if confidence > CONFIDENCE_THRESHOLD:
-            return {
-                "action": action_label,     
-                "confidence": confidence,   
-                "status": "success"
-            }
+            return {"action": action_label, "confidence": confidence, "status": "success"}
         else:
-            return {
-                "action": None,             
-                "confidence": confidence,   
-                "status": "ignored"         
-            }
+            return {"action": None, "confidence": confidence, "status": "ignored"}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/translate")
 def translate_sentence(payload: TranslationInput):
     if not llm:
         raise HTTPException(status_code=503, detail="LLM not initialized")
     try:
-        refined = llm.process_words(payload.words)
-        return {"sentence": refined}
+        return {"sentence": llm.process_words(payload.words)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
